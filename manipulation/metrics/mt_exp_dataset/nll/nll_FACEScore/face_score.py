@@ -1,0 +1,235 @@
+import torch
+import torch.nn as nn
+import traceback
+from typing import List, Iterable
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from tqdm import tqdm
+from fft_utils import FFTProcessor
+from metrics import cal_metrics
+
+
+class FACEScorer:
+    def __init__(self, 
+                 model_path: str, 
+                 tokenizer_path: str = None, 
+                 device: str = 'cuda:0', 
+                 max_length = 1024, 
+                 batch_size=4, 
+                 metrics=None, 
+                 fft_method='fft',
+                 fft_preprocess='none',
+                 fft_value='norm',
+                 fft_require_sid=True,
+                 fft_verbose=False,
+                 use_max=False):
+        """
+        :param model_path: path to the model
+        :param tokenizer_path: path to the tokenizer, if None, tokenizer will be loaded from model_path
+        :param device: cuda device to run the model
+        :param max_length: max length of the input text
+        :param batch_size: batch size for processing
+        :param metrics: a list of metrics to calculate the distance between two spectra, choose from ['so', 'corr', 'spearman', 'emd', 'kl', 'js']
+        :param fft_method: 'fft' or 'periodogram'
+        :param fft_preprocess: 'none', 'zscore', 'minmax', 'log', 'logzs
+        :param fft_value: 'norm', 'real', 'imag'
+        :param fft_require_sid: whether to output the sids of the spectrums
+        :param fft_verbose: whether to print the processing details
+        :param use_max: whether to use the max length of the two spectrums to do the interpolation, if False, use 1000 as the length
+        """
+        self.model = self.load_model(model_path, device)
+        if tokenizer_path is None:
+            self.tokenizer = self.init_tokenizer(model_path)
+        else:
+            self.tokenizer = self.init_tokenizer(tokenizer_path)
+        self.device = device
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.nll_loss = nn.NLLLoss(reduction='none')
+        self.log_softmax = nn.LogSoftmax(dim=1)
+        self.metrics = metrics
+        self.use_max = use_max
+
+        self.fft_method = fft_method
+        self.fft_preprocess = fft_preprocess
+        self.fft_value = fft_value
+        self.fft_require_sid = fft_require_sid
+        self.fft_verbose = fft_verbose
+        
+
+    def load_model(self, model_path: str, device: str):
+        model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+        return model
+
+    def init_tokenizer(self, model_path: str):
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer.pad_token = tokenizer.eos_token
+        return tokenizer
+
+    @torch.no_grad()
+    def score_texts(self, srcs: List[str], tgts: List[str], batch_size=None):
+        assert len(srcs) == len(tgts)
+        if batch_size is None:
+            batch_size = self.batch_size
+        final_scores = []
+        for i in range(0, len(srcs), batch_size):
+            src_list = srcs[i:i+batch_size]
+            tgt_list = tgts[i:i+batch_size]
+            try:
+                src_encoded = self.texts_to_encoded(src_list)
+                tgt_encoded = self.texts_to_encoded(tgt_list)
+                scores = self.score_encoded(src_encoded, tgt_encoded)
+            except RuntimeError:
+                traceback.print_exc()
+                print(f'batch {i} failed')
+                print(f'src_list: {src_list}')
+                print(f'tgt_list: {tgt_list}')
+                exit(0)
+            final_scores.extend(scores)
+        return final_scores
+    
+    def score_encoded(self, src_encoded, tgt_encoded):
+        src_nll = self.encoded_to_nll(src_encoded)
+        tgt_nll = self.encoded_to_nll(tgt_encoded)
+        scores = self.score_nlls(src_nll, tgt_nll)
+        return scores
+    
+    def score_nlls(self, src_nll: List, tgt_nll: List):
+        src_powers, src_freqs = self.nll_to_spectrum(src_nll)
+        tgt_powers, tgt_freqs = self.nll_to_spectrum(tgt_nll)
+        scores = self.spectrum_dist(src_powers, src_freqs, tgt_powers, tgt_freqs)
+        return scores
+    
+    @torch.no_grad()
+    def texts_to_encoded(self, texts: List[str], batch_size=None):
+        if batch_size is None:
+            batch_size = self.batch_size
+        if batch_size >= len(texts):
+            try:
+                encoded = self.tokenizer(texts, 
+                                        return_tensors='pt', 
+                                        padding=True, 
+                                        max_length=self.max_length).to(self.device)
+            except RuntimeError:
+                traceback.print_exc()
+                print(f'running tokenizer failed')
+                print(f'texts: {texts}')
+                exit(0)
+            return encoded
+        else:
+            return list(self.texts_to_encoded_iter(texts, batch_size))
+
+    @torch.no_grad()
+    def texts_to_encoded_iter(self, texts: List[str], batch_size=None) -> Iterable:
+        if batch_size is None:
+            batch_size = self.batch_size
+        for i in range(0, len(texts), batch_size):
+            text_list = texts[i:i+batch_size]
+            try:
+                encoded = self.tokenizer(text_list, 
+                                        return_tensors='pt', 
+                                        padding=True, 
+                                        max_length=self.max_length).to(self.device)
+            except RuntimeError:
+                traceback.print_exc()
+                print(f'batch {i} failed')
+                print(f'text_list: {text_list}')
+                exit(0)
+            yield encoded
+
+    @torch.no_grad()
+    def encoded_to_nll(self, encoded) -> List:
+        ids = encoded['input_ids']
+        output = self.model(ids, labels=ids)
+        logits = output.logits.to(self.device)
+        logits = logits.permute(0, 2, 1) # reshape logits from (B, L, V) to (B, V, L)
+        shift_logits = logits[:, :, :-1]
+        shift_targets = ids[:, 1:]
+
+        nlls = self.nll_loss(self.log_softmax(shift_logits), shift_targets)
+        mask = encoded['attention_mask'][:, 1:]
+        nll_list = []
+        for i in range(nlls.shape[0]): # Along B dimension
+            raw = nlls[i, :]
+            nll = torch.masked_select(raw, mask[i, :]>0)
+            nll_list.append(nll)
+        return nll_list
+    
+    def save_nll(self, nlls: List, path: str, decimal=4):
+        with open(path, 'w') as f:
+            for nll in nlls:
+                if isinstance(nll, torch.Tensor):
+                    nll = nll.tolist()
+                f.write(' '.join([f'{x:.{decimal}f}' for x in nll]) + '\n')
+    
+    def nll_to_spectrum(self, nlls, packed=False):
+        nlls = [nll.cpu().numpy() for nll in nlls]
+        if not self.use_max:
+            nlls = [(nll[:1000] if len(nll) > 1000 else nll) for nll in nlls]
+        
+        fft_processor = FFTProcessor(method=self.fft_method,
+                                    preprocess=self.fft_preprocess,
+                                    value=self.fft_value,
+                                    require_sid=self.fft_require_sid,
+                                    verbose=self.fft_verbose)
+        
+        if packed:
+            df = fft_processor.process(nlls, packed=True)
+            return df
+        else:
+            freqs, powers, _ = fft_processor.process(nlls, packed=False)
+            return powers, freqs
+    
+    def spectrum_dist(self, src_p, src_f, tgt_p, tgt_f):
+        results = cal_metrics(src_p, src_f, tgt_p, tgt_f, self.metrics, self.use_max)
+        return results
+
+    @torch.no_grad()
+    def texts_to_nll(self, texts: List[str], batch_size=None) -> List:
+        """
+        For quick experiment over a text input
+        """
+        if batch_size is None:
+            batch_size = self.batch_size
+        nll_list = []
+        for encoded in tqdm(self.texts_to_encoded_iter(texts, batch_size), total=len(texts)//batch_size+1):
+            nll_list.extend(self.encoded_to_nll(encoded))
+        return nll_list
+
+    @torch.no_grad()
+    def texts_to_nll_with_tokens(self, texts: List[str], batch_size=None) -> List[dict]:
+        """
+        Outputs NLL and corresponding tokens for each input text.
+        Returns a list of dictionaries where each dictionary contains:
+          - 'tokens': List of tokens for the input text
+          - 'nll': List of NLL values corresponding to the tokens
+        """
+        if batch_size is None:
+            batch_size = self.batch_size
+        
+        result_list = []
+        for encoded in tqdm(self.texts_to_encoded_iter(texts, batch_size), total=len(texts) // batch_size + 1):
+            # Get NLL values for the batch
+            nlls = self.encoded_to_nll(encoded)
+            
+            # Decode tokens for the batch
+            input_ids = encoded['input_ids']
+            tokenized_texts = [self.tokenizer.convert_ids_to_tokens(ids) for ids in input_ids]
+            
+            # Align tokens and NLL values
+            for tokens, nll in zip(tokenized_texts, nlls):
+                # Ensure alignment between tokens and NLL (trim to same length if necessary)
+                aligned_tokens = tokens[1:len(nll) + 1]  # Skip the start token if present
+                result_list.append({
+                    'tokens': aligned_tokens,
+                    'nll': nll.tolist()
+                })
+        return result_list
+
+    @torch.no_grad()
+    def texts_to_spectrum(self, texts: List[str], batch_size=None):
+        """
+        For quick experiment over a text input
+        """
+        nll_list = self.texts_to_nll(texts, batch_size)
+        df = self.nll_to_spectrum(nll_list, packed=True)
+        return df
